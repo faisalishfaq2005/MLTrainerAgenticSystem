@@ -1,0 +1,6 @@
+1. rewrite the intake_manager_agent again with llm router logic like using llm for conversation and collecting all required data instead of writing hardcoded rules
+2. make the credential validator functions like tools which the llm can invoke to conform correct credentials are enter while conversation
+3. make the llm_router using actual litellm
+4. make the cli applicaiton and actually test till here by doing actual conversations
+6. for this you will olso need to make the orchestrator , see what to use langraph etc
+5. make sure every type of prompt is successfully parsed till second agent

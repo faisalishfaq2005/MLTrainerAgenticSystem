@@ -4,7 +4,7 @@ import logging
 import time
  
 logger = logging.getLogger(__name__)
- 
+from orchestrator.job_context import JobContext
 
 class AgentError(Exception):
     """Raised when an agent fails after all retries are exhausted."""
@@ -35,13 +35,13 @@ class BaseAgent(ABC):
 
         super().__init__()
 
-    def run(self, context:"JobContext") -> dict:
+    def run(self, context:JobContext) -> dict:
         self.logger.info(f"Starting agent: {self.name}")
         start = time.monotonic()
 
         try:
             result=self._execute(context)
-            elapsed= time.monotonic - start
+            elapsed= time.monotonic() - start
             self.logger.info(f"Agent {self.name} completed in {elapsed:.1f}s")
             return {"status":"ok", "agent":self.name, **result}
         except AgentError:
@@ -53,7 +53,7 @@ class BaseAgent(ABC):
         
     
     @abstractmethod
-    def _execute(self,context: "JobContext") -> dict:
+    def _execute(self,context: JobContext) -> dict:
         """
         Subclasses implement the actual work here.
         Must return a dict of results that will be merged into the context.
@@ -64,7 +64,7 @@ class BaseAgent(ABC):
             codegen_agent  → {"train_script": "...", "requirements": "..."}
         """
     
-    def _require_context_keys(self, context: "JobContext", *keys: str):  # noqa: F821
+    def _require_context_keys(self, context: JobContext, *keys: str):  # noqa: F821
         """Helper — raise clearly if a required context field is missing."""
         for key in keys:
             if getattr(context, key, None) is None:
