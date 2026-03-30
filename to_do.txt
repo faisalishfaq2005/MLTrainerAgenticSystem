@@ -1,6 +1,14 @@
 1. rewrite the intake_manager_agent again with llm router logic like using llm for conversation and collecting all required data instead of writing hardcoded rules
 2. make the credential validator functions like tools which the llm can invoke to conform correct credentials are enter while conversation
-3. make the llm_router using actual litellm
 4. make the cli applicaiton and actually test till here by doing actual conversations
 6. for this you will olso need to make the orchestrator , see what to use langraph etc
 5. make sure every type of prompt is successfully parsed till second agent
+7. see the whole orchestrator code update for changes according to your will, update jobcontext and agents according to this orchestrator code eg like adding option for accounting for error message on retries
+8. orchestrator code need many changes look for all aspects and then update accordingly
+9. in orchestrator code the job context has more fields so see into that
+10. another problem the intake manager agent is using litellm but api keys are to be configured in this sections output, so use default models for this agent to work
+11. i have to make a design that when one agent does its part and writes to job context , the job context is saved into db before going to the next stage, the orchestrator handles this
+
+
+first thing to start tommorrow
+integrate the credential validator as tools 
