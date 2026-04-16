@@ -1,0 +1,7 @@
+from enum import Enum
+
+class Agents:
+    INTAKE_MANAGER_AGENT="INTAKE_MANAGER_AGENT"
+    INTENT_PARSER_AGENT="INTENT_PARSER_AGENT"
+
+

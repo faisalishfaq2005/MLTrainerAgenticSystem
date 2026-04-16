@@ -1,14 +1,51 @@
-1. rewrite the intake_manager_agent again with llm router logic like using llm for conversation and collecting all required data instead of writing hardcoded rules
+1.another problem the intake manager agent is using litellm 
+but api keys are to be configured in this sections output,
+ so use default models for this agent to work, solution for this the orchestrator will use
+ two llmrouter instances one will be made for this agent with free fallback models and one for rest of 
+ all agents
+
 2. make the credential validator functions like tools which the llm can invoke to conform correct credentials are enter while conversation
 4. make the cli applicaiton and actually test till here by doing actual conversations
-6. for this you will olso need to make the orchestrator , see what to use langraph etc
+
 5. make sure every type of prompt is successfully parsed till second agent
 7. see the whole orchestrator code update for changes according to your will, update jobcontext and agents according to this orchestrator code eg like adding option for accounting for error message on retries
 8. orchestrator code need many changes look for all aspects and then update accordingly
 9. in orchestrator code the job context has more fields so see into that
-10. another problem the intake manager agent is using litellm but api keys are to be configured in this sections output, so use default models for this agent to work
+
 11. i have to make a design that when one agent does its part and writes to job context , the job context is saved into db before going to the next stage, the orchestrator handles this
 
 
 first thing to start tommorrow
-integrate the credential validator as tools 
+2.integrate the credential validator as tools 
+
+
+architectural things to take care of 
+1. One important caveat: your current router mutates process-wide environment variables
+when an API key is set in router.py, so if you ever run multiple jobs/users
+concurrently, shared/global state can leak between them. If concurrency matters, 
+that is the real architectural risk to address next.
+
+2 . architectural design 
+Yes, that is the right mental model.
+
+In a multi-user web app, you usually do not want one shared “live conversation state” for everyone. Instead, each user interaction starts a separate job with its own job_id, and all mutable runtime state for that user stays attached to that job. So user A and user B can both be active at the same time, but they each have isolated state, isolated intake progress, isolated collected_info, and eventually isolated training/deployment results.
+
+What should be shared is only the code and services that are safe to reuse, like the orchestrator class definition, the graph definition, prompt templates, and maybe a database connection pool. What should not be shared globally is per-user state like conversation history, selected model provider, API key, current stage, or router credentials.
+
+A simple flow looks like this:
+
+User logs in and clicks “start training”.
+Backend creates a new job_id for that user.
+That job gets its own intake state and its own intake agent instance.
+The user chats with that job until enough info is collected.
+The intake step stores collected_info in that job only.
+The orchestrator creates the downstream router for that job using that job’s credentials.
+The rest of the pipeline runs only for that job.
+Results are saved back to that job record.
+So yes, your design should be “one job per user request/session,” and the job should own the user-specific runtime objects. But there is one nuance: the orchestrator itself does not have to be a separate Python object per user in the strict sense. It can be one server-level service that manages many jobs, as long as each job has its own isolated state and object instances where needed.
+
+The important rule is this: do not put user-specific credentials or conversation state in module globals or shared singleton state. If you do that, user A’s data can leak into user B’s run.
+
+can do 
+introduce feedback learning so the agent learns what it did better and what not
+introduce 

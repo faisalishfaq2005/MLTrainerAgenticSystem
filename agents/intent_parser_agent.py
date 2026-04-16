@@ -28,6 +28,7 @@ import logging
 from agents.base_agent import BaseAgent, AgentError
 from agent_schemas.intent_parser_schema import INTENT_JSON_TEMPLATE
 from llm.prompts.intent_parser_agent_prompt import INTENT_PARSER_AGENT_SYSTEM_PROMPT
+from agents.agent_names import Agents
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ class IntentParserAgent(BaseAgent):
     """
 
     def __init__(self, llm_router):
-        super().__init__(name="intent_parser", llm_router=llm_router)
+        super().__init__(name=Agents.INTENT_PARSER_AGENT, llm_router=llm_router)
 
     def _execute(self, context) -> dict:
         self._require_context_keys(context, "raw_prompt", "collected_info")
@@ -149,7 +150,7 @@ class IntentParserAgent(BaseAgent):
                     pass
             raise AgentError(
                 agent_name=self.name,
-                stage="intent_parsing",
+                stage=Agents.INTENT_PARSER_AGENT,
                 reason=f"LLM returned invalid JSON. First 300 chars: {raw[:300]}"
             )
 
@@ -222,7 +223,7 @@ class IntentParserAgent(BaseAgent):
         if task not in valid_tasks:
             raise AgentError(
                 agent_name=self.name,
-                stage="intent_parsing",
+                stage=Agents.INTENT_PARSER_AGENT,
                 reason=(
                     f"LLM returned unrecognised task_type='{task}'. "
                     f"Must be one of: {', '.join(sorted(valid_tasks))}"

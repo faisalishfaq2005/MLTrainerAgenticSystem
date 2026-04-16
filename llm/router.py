@@ -40,10 +40,11 @@ USAGE:
 
 import os
 import logging
-from typing import Optional, Any
+from typing import Optional, Any,Union
 
 import litellm
 from litellm import completion
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -190,11 +191,11 @@ class LLMRouter:
     def complete(
         self,
         system_prompt: str,
-        user_message: str,
+        user_message: Optional[str],
         message_history: Optional[list[dict[str, str]]] = None,
         tools: Optional[list[dict[str, Any]]] = None,
         tool_choice: Optional[Any] = None,
-    ) -> str:
+    ) -> Union[str,dict]:
         """
         Send a (system, user) message pair and return the response text.
 
@@ -229,11 +230,14 @@ class LLMRouter:
         if message_history:
             messages.extend(message_history)
 
-        messages.append({"role": "user", "content": user_message})
+        if user_message is not None:
+            messages.append({"role": "user", "content": user_message})
+
+        user_len = len(user_message) if isinstance(user_message, str) else 0
 
         logger.debug(
             f"→ {self._display_name} | "
-            f"system={len(system_prompt)}c user={len(user_message)}c"
+            f"system={len(system_prompt)}c user={user_len}c"
         )
 
         try:
@@ -257,23 +261,36 @@ class LLMRouter:
             response = completion(
                 **request_kwargs,
             )
+            
+            message=response.choices[0].message
+            if hasattr(message, 'tool_calls') and message.tool_calls:
+                return {
+                    "content": message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "name": tc.function.name,
+                            "arguments": json.loads(tc.function.arguments)
+                        }
+                        for tc in message.tool_calls
+                    ]
+                }
+           
 
-            text = response.choices[0].message.content
-
-            if text is None:
+            if message.content is None:
                 raise LLMRouterError(
                     f"{self._display_name} returned an empty content field."
                 )
 
-            result = text.strip()
+            
 
             logger.debug(
                 f"← {self._display_name} | "
-                f"{len(result)}c | "
+                f"{len(message.content)}c | "
                 f"tokens={self._token_summary(response)}"
             )
 
-            return result
+            return message.content
 
         # Re-raise our own error type unchanged
         except LLMRouterError:
