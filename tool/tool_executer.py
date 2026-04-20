@@ -29,7 +29,10 @@ class ToolExecuter:
     
     def execute_tool(self,tool_name:str,tool_args:dict):
         try:
-            return self._tools.execute_tool(tool_name, tool_args)
+            logger.info("TOOL_EXECUTE agent=%s tool=%s args=%s", self._agent_type, tool_name, self._safe_json(self._sanitize_for_log(tool_args)))
+            result = self._tools.execute_tool(tool_name, tool_args)
+            logger.info("TOOL_RESULT agent=%s tool=%s payload=%s", self._agent_type, tool_name, self._safe_json(self._sanitize_for_log(result)))
+            return result
         except Exception as e:
             logger.exception(f"Tool execution failed: {tool_name}")
             return {
@@ -37,6 +40,29 @@ class ToolExecuter:
                 "error": f"Tool execution failed: {str(e)}",
                 "data": None
             }
+
+    @staticmethod
+    def _sanitize_for_log(value):
+        if isinstance(value, dict):
+            sanitized = {}
+            for k, v in value.items():
+                key_l = str(k).lower()
+                if any(secret_key in key_l for secret_key in ("token", "key", "api_key", "authorization")):
+                    sanitized[k] = "***"
+                else:
+                    sanitized[k] = ToolExecuter._sanitize_for_log(v)
+            return sanitized
+        if isinstance(value, list):
+            return [ToolExecuter._sanitize_for_log(v) for v in value]
+        return value
+
+    @staticmethod
+    def _safe_json(value) -> str:
+        try:
+            import json
+            return json.dumps(value, ensure_ascii=True)
+        except Exception:
+            return str(value)
     def __repr__(self):
         return f"ToolExecutor({self._agent_type})"
 

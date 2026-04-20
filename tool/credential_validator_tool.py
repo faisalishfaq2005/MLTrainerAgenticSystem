@@ -15,7 +15,7 @@ class CredentialValidatorTools(BaseTool):
                 "type": "function",
                 "function": {
                     "name": "validate_hf_token",
-                    "description": "Validate a HuggingFace token by calling the HF API. Returns (is_valid: bool, error_message: str | None). Use this immediately when user provides an HF token to verify it's correct before storing it.",
+                    "description": "Validate a HuggingFace token.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -32,7 +32,7 @@ class CredentialValidatorTools(BaseTool):
                 "type": "function",
                 "function": {
                     "name": "validate_kaggle_credentials",
-                    "description": "Validate Kaggle username and API key by calling Kaggle API. Returns (is_valid: bool, error_message: str | None). Use this immediately when user provides Kaggle credentials to verify they're correct.",
+                    "description": "Validate Kaggle username and API key.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -53,13 +53,13 @@ class CredentialValidatorTools(BaseTool):
                 "type": "function",
                 "function": {
                     "name": "validate_llm_api_key",
-                    "description": "Validate an LLM provider API key (anthropic, openai, google). Returns (is_valid: bool, error_message: str | None). Use this when user provides an LLM API key to verify it works.",
+                    "description": "Validate an LLM provider API key.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "provider": {
                                 "type": "string",
-                                "enum": ["anthropic", "openai", "google", "ollama"],
+                                "enum": ["anthropic", "openai", "google", "groq", "ollama"],
                                 "description": "The LLM provider name"
                             },
                             "api_key": {
@@ -77,11 +77,7 @@ class CredentialValidatorTools(BaseTool):
         self._validator=CredentialValidator()
         if tool_name=="validate_hf_token":
             token=tool_args.get("token","")
-            is_valid,error=self._validator.validate_hf_token(token)
-
-            username=None
-            if is_valid:
-                username=self._validator.get_hf_username(token)
+            is_valid, error, username = self._validator.validate_hf_token_with_username(token)
 
             return {
                 "is_valid":is_valid,

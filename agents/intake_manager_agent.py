@@ -1,10 +1,11 @@
 
 import re
 import logging
+import time
 from dataclasses import dataclass, field
 import json
 from typing import Optional, Any
-from llm.router import LLMRouter
+from llm.router import LLMRouter, LLMRouterError
 from orchestrator.job_context import JobContext
 from agents.base_agent import BaseAgent, AgentError
 from tool.credential_validator_tool import CredentialValidatorTools
@@ -73,6 +74,7 @@ class IntakeManagerAgent(BaseAgent):
         self._state=_IntakeState()
         self._validator_tools=ToolExecuter(Agents.INTAKE_MANAGER_AGENT)
         
+        
 
     #orhestrator will fisrt call get_opening_message and then converse function turn by turn until the converse function returns ready:True
     # the loop of calling converse till ready:True, will be in orchestrator , not here, because orchestrator is interacting wih frontend api and needs to send llm response to frontend and user message to agent
@@ -102,7 +104,6 @@ class IntakeManagerAgent(BaseAgent):
               • \"Image classifier for 5 dog breeds, EfficientNet backbone\"\n\n
             You can give as much or as little detail as you like — 
             I'll ask for anything I need."""
-        self._state.messages.append({"role":"assistant","content":opening_message})
         return opening_message
        
    
@@ -110,15 +111,18 @@ class IntakeManagerAgent(BaseAgent):
 #make a tool olso that the llm can call to see if all required info is collected 
     def converse(self, user_message:str) -> dict:
         try:
+            logger.info("INTAKE_TURN_START user_len=%s history_len=%s", len(user_message or ""), len(self._state.messages))
             self.populate_raw_prompt(user_message=user_message)
 
-            raw_response=self.llm_router.complete(
+            raw_response=self._complete_with_rate_limit_retry(
                 system_prompt=INTAKE_MANAGER_AGENT_SYSTEM_PROMPT,
                 user_message=user_message,
                 message_history=self._state.messages,
                 tools=self._validator_tools.get_tool_definitions(),
                 tool_choice="auto"
             )
+
+            logger.info("LLM_RESPONSE_1 %s", self._safe_json(raw_response))
 
             if not raw_response:
                 raise AgentError(agent_name=self.name,stage=Agents.INTAKE_MANAGER_AGENT,reason="LLM returned empty response")
@@ -127,8 +131,12 @@ class IntakeManagerAgent(BaseAgent):
 
             response, data_dict, tool_locked_fields = self._resolve_response_with_tools(raw_response=raw_response)
 
+            logger.info("FINAL_INTAKE_DATA locked_fields=%s payload=%s", sorted(tool_locked_fields), self._safe_json(data_dict))
+
             self.populate_intake_state(data_dict, tool_locked_fields=tool_locked_fields)
             ready = self.determine_ready_state()
+
+            logger.info("INTAKE_TURN_END ready=%s", ready)
 
             self._state.messages.append({"role":"assistant","content":response})
 
@@ -147,14 +155,23 @@ class IntakeManagerAgent(BaseAgent):
         max_tool_rounds = 3
         tool_locked_fields: set[str] = set()
 
-        for _ in range(max_tool_rounds):
+        for round_idx in range(max_tool_rounds):
             if isinstance(current_response, dict) and current_response.get("tool_calls"):
+                tool_calls = current_response.get("tool_calls", [])
+                logger.info(
+                    "LLM_TOOL_CALLS round=%s count=%s names=%s",
+                    round_idx + 1,
+                    len(tool_calls),
+                    [tc.get("name", "") for tc in tool_calls],
+                )
                 self._append_assistant_tool_call_message(current_response)
 
                 for tool in current_response["tool_calls"]:
                     tool_name = tool.get("name", "")
                     tool_args = tool.get("arguments", {})
+                    logger.info("TOOL_EXECUTE name=%s args=%s", tool_name, self._safe_json(tool_args))
                     tool_result = self._validator_tools.execute_tool(tool_name=tool_name, tool_args=tool_args)
+                    logger.info("TOOL_RESULT name=%s payload=%s", tool_name, self._safe_json(tool_result))
                     self._apply_tool_result(tool_name=tool_name, tool_args=tool_args, tool_result=tool_result)
                     tool_locked_fields.update(self._locked_fields_for_tool(tool_name))
 
@@ -167,13 +184,14 @@ class IntakeManagerAgent(BaseAgent):
                         }
                     )
 
-                current_response = self.llm_router.complete(
+                current_response = self._complete_with_rate_limit_retry(
                     system_prompt=INTAKE_MANAGER_AGENT_SYSTEM_PROMPT,
                     user_message=None,
                     message_history=self._state.messages,
                     tools=self._validator_tools.get_tool_definitions(),
                     tool_choice="auto",
                 )
+                logger.info("LLM_RESPONSE_FOLLOWUP %s", self._safe_json(current_response))
                 continue
 
             response, data_dict = self.parse_response(raw_response=current_response)
@@ -240,7 +258,62 @@ class IntakeManagerAgent(BaseAgent):
             return {"llm_provider", "llm_api_key"}
         return set()
 
+    def _complete_with_rate_limit_retry(self, **complete_kwargs):
+        delays_seconds = [3, 20]
 
+        for attempt in range(len(delays_seconds) + 1):
+            try:
+                logger.info("LLM_CALL attempt=%s/%s", attempt + 1, len(delays_seconds) + 1)
+                return self.llm_router.complete(**complete_kwargs)
+            except LLMRouterError as e:
+                error_text = str(e).lower()
+                is_rate_limit = "rate limit" in error_text
+                if not is_rate_limit or attempt >= len(delays_seconds):
+                    raise
+
+                delay = delays_seconds[attempt]
+                logger.warning(
+                    "Rate limit from intake LLM call. Retrying in %ss (attempt %s/%s).",
+                    delay,
+                    attempt + 2,
+                    len(delays_seconds) + 1,
+                )
+                time.sleep(delay)
+
+    @staticmethod
+    def _mask_secret(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+
+        prefixes = ("hf_", "sk-", "sk-ant-", "gsk_", "AIza")
+        if any(value.startswith(prefix) for prefix in prefixes):
+            if len(value) <= 8:
+                return "***"
+            return f"{value[:4]}...{value[-4:]}"
+
+        return value
+
+    @classmethod
+    def _sanitize_for_log(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            sanitized = {}
+            for k, v in value.items():
+                key_l = str(k).lower()
+                if any(secret_key in key_l for secret_key in ("token", "key", "api_key", "authorization")):
+                    sanitized[k] = "***"
+                else:
+                    sanitized[k] = cls._sanitize_for_log(v)
+            return sanitized
+        if isinstance(value, list):
+            return [cls._sanitize_for_log(v) for v in value]
+        return cls._mask_secret(value)
+
+    @classmethod
+    def _safe_json(cls, value: Any) -> str:
+        try:
+            return json.dumps(cls._sanitize_for_log(value), ensure_ascii=True)
+        except Exception:
+            return str(value)
 
     def parse_response(self,raw_response):
         try:
@@ -251,7 +324,18 @@ class IntakeManagerAgent(BaseAgent):
                     reason="Expected final JSON string response, received unresolved tool-call payload",
                 )
 
-            parsed = json.loads(raw_response)
+            if not isinstance(raw_response, str):
+                raise AgentError(
+                    agent_name=Agents.INTAKE_MANAGER_AGENT,
+                    stage=Agents.INTAKE_MANAGER_AGENT,
+                    reason=f"Expected string response from LLM, got {type(raw_response).__name__}",
+                )
+
+            cleaned = raw_response.strip()
+            cleaned = re.sub(r"^```(?:json)?\\s*", "", cleaned)
+            cleaned = re.sub(r"\\s*```$", "", cleaned)
+
+            parsed = json.loads(cleaned)
 
             response = parsed["response"]
             intake_data = parsed["intake_data"]
@@ -266,7 +350,6 @@ class IntakeManagerAgent(BaseAgent):
                     stage=Agents.INTAKE_MANAGER_AGENT,
                     reason="Invalid response or intake_data type"
                 )
-                
 
             return response , intake_data
         except Exception as e:
@@ -319,7 +402,7 @@ class IntakeManagerAgent(BaseAgent):
 
         if "llm_api_key" not in locked and _is_new_value("llm_api_key"):
             s.llm_api_key = data_dict.get("llm_api_key")
-            if s.llm_provider in {"anthropic", "openai", "google"}:
+            if s.llm_provider in {"anthropic", "openai", "google", "groq"}:
                 s.llm_key_valid = False
                 s._llm_key_error = "LLM API key changed; needs validation."
 
@@ -354,7 +437,7 @@ class IntakeManagerAgent(BaseAgent):
 
         # LLM settings are optional globally, but once a paid provider key is given,
         # ensure that key is validated before readiness.
-        if self._state.llm_provider in {"anthropic", "openai", "google"}:
+        if self._state.llm_provider in {"anthropic", "openai", "google", "groq"}:
             if not self._state.llm_api_key:
                 return False
             if not self._state.llm_key_valid:

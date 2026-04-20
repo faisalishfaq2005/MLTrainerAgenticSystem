@@ -25,40 +25,55 @@ class CredentialValidator:
         Calls HF /api/whoami to confirm the token is valid.
         Returns (True, None) on success, (False, error_msg) on failure.
         """
+        is_valid, error, _username = CredentialValidator.validate_hf_token_with_username(token)
+        return is_valid, error
+
+    @staticmethod
+    def validate_hf_token_with_username(token: str) -> tuple[bool, str | None, str | None]:
+        """
+        Validate HF token and return username in a single API call.
+        Returns (is_valid, error_message, username).
+        """
         if not token or not token.startswith("hf_"):
-            return False, "HuggingFace tokens must start with 'hf_'. Please check your token."
+            return False, "HuggingFace tokens must start with 'hf_'. Please check your token.", None
 
         try:
             resp = httpx.get(
-                "https://huggingface.co/api/whoami",
+                "https://huggingface.co/api/whoami-v2",
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=8,
             )
             if resp.status_code == 200:
                 data = resp.json()
-                username = data.get("name", "unknown")
+                username = (
+                    data.get("name")
+                    or data.get("username")
+                    or data.get("user")
+                    or "unknown"
+                )
                 logger.info(f"HF token valid for user: {username}")
-                return True, None
+                return True, None, username
             elif resp.status_code == 401:
-                return False, "HuggingFace token is invalid or expired. Generate a new one at https://huggingface.co/settings/tokens"
+                return False, "HuggingFace token is invalid or expired. Generate a new one at https://huggingface.co/settings/tokens", None
             else:
-                return False, f"HuggingFace API returned unexpected status {resp.status_code}. Please try again."
+                return False, f"HuggingFace API returned unexpected status {resp.status_code}. Please try again.", None
         except httpx.TimeoutException:
-            return False, "HuggingFace API timed out. Check your internet connection."
+            return False, "HuggingFace API timed out. Check your internet connection.", None
         except Exception as e:
-            return False, f"Could not reach HuggingFace API: {e}"
+            return False, f"Could not reach HuggingFace API: {e}", None
 
     @staticmethod
     def get_hf_username(token: str) -> str | None:
         """Returns the HF username for a valid token, or None."""
         try:
             resp = httpx.get(
-                "https://huggingface.co/api/whoami",
+                "https://huggingface.co/api/whoami-v2",
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=8,
             )
             if resp.status_code == 200:
-                return resp.json().get("name")
+                data = resp.json()
+                return data.get("name") or data.get("username") or data.get("user")
         except Exception:
             pass
         return None
@@ -110,10 +125,33 @@ class CredentialValidator:
             return CredentialValidator._check_openai(api_key)
         elif provider == "google":
             return CredentialValidator._check_google(api_key)
+        elif provider == "groq":
+            return CredentialValidator._check_groq(api_key)
         elif provider == "ollama":
             return True, None  # local, no key needed
         else:
-            return False, f"Unknown LLM provider '{provider}'. Supported: anthropic, openai, google, ollama"
+            return False, f"Unknown LLM provider '{provider}'. Supported: anthropic, openai, google, groq, ollama"
+    
+    @staticmethod 
+    def _check_groq(api_key:str) -> tuple[bool, str | None]:
+        if not api_key.startswith("gsk_"):
+            return False, "Groq API keys typically start with 'gsk_'. Please check your key."
+        try:
+            resp = httpx.get(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                return True, None
+            elif resp.status_code == 401:
+                return False, "Groq API key is invalid. Check https://console.groq.com/keys"
+            elif resp.status_code == 429:
+                return True, None  # key valid, temporarily rate limited
+            else:
+                return False, f"Groq API returned status {resp.status_code}."
+        except Exception as e:
+            return False, f"Could not reach Groq API: {e}"
 
     @staticmethod
     def _check_anthropic(api_key: str) -> tuple[bool, str | None]:

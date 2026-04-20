@@ -79,6 +79,11 @@ MODEL_REGISTRY: dict[str, dict[str, str]] = {
         "gemini-2.0-flash": "gemini/gemini-2.0-flash",
         "gemini-1.5-pro":   "gemini/gemini-1.5-pro",
     },
+    "groq": {
+        # Groq models are routed via the groq provider prefix
+        "qwen/qwen3-32b": "groq/qwen/qwen3-32b",
+        "llama-3.3-70b-versatile": "groq/llama-3.3-70b-versatile",
+    },
     "ollama": {
         # Ollama models need the "ollama/" prefix in litellm
         "qwen2.5-coder:14b": "ollama/qwen2.5-coder:14b",
@@ -94,12 +99,15 @@ DEFAULT_MODEL: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     "openai":    "gpt-4o",
     "google":    "gemini-2.0-flash",
+    "groq":      "qwen/qwen3-32b",
     "ollama":    "qwen2.5-coder:14b",
+    
 }
 
 # Free fallback used when user does not provide provider/model, or provides a
 # paid provider without a key. Ordered strongest-to-lightest for coding tasks.
 FREE_MODEL_FALLBACKS: list[tuple[str, str]] = [
+    ("groq", "llama-3.3-70b-versatile"),
     ("ollama", "qwen2.5-coder:14b"),
     ("ollama", "qwen2.5-coder:7b"),
     ("ollama", "llama3"),
@@ -112,6 +120,7 @@ API_KEY_ENV_VAR: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai":    "OPENAI_API_KEY",
     "google":    "GEMINI_API_KEY",
+    "groq":      "GROQ_API_KEY",
     "ollama":    "",   # local — no key needed
 }
 
@@ -129,7 +138,7 @@ class LLMRouter:
     They never import litellm or any provider SDK directly.
 
     Args:
-        provider:    "anthropic" | "openai" | "google" | "ollama"
+        provider:    "anthropic" | "openai" | "google" | "groq" | "ollama"
         model:       Model name from MODEL_REGISTRY (e.g. "claude-sonnet-4-6").
                      Defaults to DEFAULT_MODEL[provider] if not given.
         api_key:     Provider API key. Falls back to environment variable if None.
@@ -175,12 +184,24 @@ class LLMRouter:
         self._display_name  = f"{provider}/{model_name}"
         self._api_key       = api_key
 
+        # If no explicit key is passed, attempt provider env var.
+        if not api_key and provider != "ollama":
+            env_var = API_KEY_ENV_VAR.get(provider, "")
+            if env_var:
+                api_key = self._clean_opt(os.getenv(env_var))
+
         # Inject the API key into the environment so litellm can find it.
         # This is necessary because litellm reads from env vars internally.
         if api_key and provider != "ollama":
             env_var = API_KEY_ENV_VAR.get(provider, "")
             if env_var:
                 os.environ[env_var] = api_key
+
+        if provider != "ollama" and not api_key:
+            raise LLMRouterError(
+                f"No API key available for provider '{provider}'. "
+                f"Set {API_KEY_ENV_VAR.get(provider, '<PROVIDER>_API_KEY')} or pass api_key explicitly."
+            )
 
         logger.info(f"LLMRouter ready: {self._display_name}")
 
@@ -337,7 +358,14 @@ class LLMRouter:
     # -----------------------------------------------------------------------
 
     @classmethod
-    def from_collected_info(cls, collected_info: dict, **kwargs) -> "LLMRouter":
+    def from_collected_info(
+        cls,
+        collected_info: dict,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        timeout: Optional[int] = None,
+        **kwargs,
+    ) -> "LLMRouter":
         """
         Build a router from context.collected_info (written by IntakeManagerAgent).
 
@@ -347,7 +375,7 @@ class LLMRouter:
             # now pass router into every agent's constructor
 
         collected_info keys used:
-            llm_provider  — "anthropic" | "openai" | "google" | "ollama" | None
+            llm_provider  — "anthropic" | "openai" | "google" | "groq" | "ollama" | None
             llm_model     — model name e.g. "claude-sonnet-4-6"
             llm_api_key   — validated API key (None for ollama / free fallback)
 
@@ -357,7 +385,11 @@ class LLMRouter:
             3) If provider is paid but key is missing, switch to free fallback.
             4) If model is missing, use DEFAULT_MODEL for the resolved provider.
 
-        kwargs: optional overrides like max_tokens=4096, temperature=0.2
+        Per-agent overrides:
+            max_tokens, temperature, timeout can be set directly here so
+            different agents can use different token/latency budgets.
+        kwargs:
+            Any additional LLMRouter constructor overrides.
         """
         provider = cls._clean_opt(collected_info.get("llm_provider"))
         model = cls._clean_opt(collected_info.get("llm_model"))
@@ -377,7 +409,7 @@ class LLMRouter:
 
         # If a paid provider is selected without a key, degrade gracefully to a
         # free fallback model so the pipeline can still run.
-        if provider in {"anthropic", "openai", "google"} and not api_key:
+        if provider in {"anthropic", "openai", "google", "groq"} and not api_key:
             fallback_provider, fallback_model = cls._pick_free_fallback()
             logger.warning(
                 "No API key provided for paid provider '%s'. "
@@ -386,16 +418,26 @@ class LLMRouter:
                 fallback_provider,
                 fallback_model,
             )
-            provider, model, api_key = fallback_provider, fallback_model, None
+            provider, model = fallback_provider, fallback_model
+            env_var = API_KEY_ENV_VAR.get(provider, "")
+            api_key = cls._clean_opt(os.getenv(env_var)) if env_var else None
 
         if not model:
             model = DEFAULT_MODEL.get(provider)
+
+        init_kwargs = dict(kwargs)
+        if max_tokens is not None:
+            init_kwargs["max_tokens"] = max_tokens
+        if temperature is not None:
+            init_kwargs["temperature"] = temperature
+        if timeout is not None:
+            init_kwargs["timeout"] = timeout
 
         return cls(
             provider=provider,
             model=model,
             api_key=api_key,
-            **kwargs,
+            **init_kwargs,
         )
 
     @staticmethod
@@ -411,6 +453,8 @@ class LLMRouter:
         """Infer provider from common API key prefixes."""
         if api_key.startswith("sk-ant-"):
             return "anthropic"
+        if api_key.startswith("gsk_"):
+            return "groq"
         if api_key.startswith("sk-"):
             return "openai"
         if api_key.startswith("AIza"):
