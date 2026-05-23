@@ -833,12 +833,14 @@ source = { virtual = "." }
 dependencies = [
     { name = "httpx" },
     { name = "litellm" },
+    { name = "rich" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "litellm", specifier = ">=1.83.8" },
+    { name = "rich", specifier = ">=13.0.0" },
 ]
 
 [[package]]

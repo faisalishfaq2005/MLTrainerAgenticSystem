@@ -17,3 +17,6 @@ wheels/
 # Logging files
 logs/
 *.log
+
+workspace/
+*.workspace
