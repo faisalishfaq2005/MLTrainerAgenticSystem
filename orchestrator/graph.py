@@ -91,7 +91,7 @@ def _make_stage_node(stage_name: str, get_agent: Callable) -> Callable:
     Returns:
         A node function: (state: PipelineState) -> dict
     """
-    _agent = None  # cached after first call
+    _agent = None  # cached after first call 
 
     def node(state: PipelineState) -> dict:
         nonlocal _agent

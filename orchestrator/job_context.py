@@ -64,11 +64,25 @@ class JobContext:
     stage_results: dict = field(default_factory=dict)  # stage_name → result dict
     errors: list = field(default_factory=list)
 
+    # ── Orchestrator control (set and read only by the orchestrator) ─────────
+    retry_counts: dict = field(default_factory=dict)   # stage_name → attempts so far
+    pipeline_failed: bool = False
+    failure_reason: Optional[str] = None
+
+    # ── Retry feedback (written by RetryHandler, read by agents) ─────────────
+    # Maps stage_name → the error message from the most recent failed attempt.
+    # An agent checks this at the start of _execute() and, if its own stage
+    # has an entry, includes the error in its next LLM call so the model can
+    # self-correct. Cleared per-stage once the stage succeeds.
+    last_error_feedback: dict = field(default_factory=dict)
+
     def to_dict(self) -> dict:
         """Serialise to dict for SQLite persistence."""
-        import dataclasses, json
+        import dataclasses
         return dataclasses.asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "JobContext":
-        return cls(**d)
+        import dataclasses
+        valid = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in valid})

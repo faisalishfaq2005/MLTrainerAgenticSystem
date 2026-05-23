@@ -75,5 +75,49 @@ class BaseAgent(ABC):
                            f"Ensure the preceding agent populated it.",
                 )
 
+    # ── Retry-feedback helpers ────────────────────────────────────────────────
+    # RetryHandler writes the previous attempt's error into
+    # context.last_error_feedback[stage_name].  These two helpers let every
+    # agent read that feedback and inject it into its LLM call without
+    # duplicating the lookup logic.
+
+    def _get_retry_feedback(self, context: JobContext):
+        """
+        Return the error string from the previous failed attempt for this
+        agent's stage, or None if this is the first attempt.
+
+        Use this when the agent builds a single string prompt:
+            feedback = self._get_retry_feedback(context)
+            if feedback:
+                prompt += f"\\n\\nPREVIOUS ATTEMPT FAILED:\\n{feedback}"
+        """
+        return (context.last_error_feedback or {}).get(self.name)
+
+    def _apply_retry_feedback_to_messages(self, messages: list, context: JobContext) -> list:
+        """
+        If there is retry feedback for this stage, append it as an extra
+        user message at the end of the messages list so the LLM sees it
+        as the most recent human turn before it responds.
+
+        Use this when the agent passes a message-history list to the LLM:
+            messages = self._apply_retry_feedback_to_messages(messages, context)
+            response = self.llm_router.complete(..., message_history=messages)
+
+        Returns a new list — the original is never mutated.
+        """
+        feedback = self._get_retry_feedback(context)
+        if not feedback:
+            return messages
+        return list(messages) + [
+            {
+                "role": "user",
+                "content": (
+                    "Your previous response failed validation.\n"
+                    f"Error: {feedback}\n\n"
+                    "Please correct the mistake and try again."
+                ),
+            }
+        ]
+
     
 

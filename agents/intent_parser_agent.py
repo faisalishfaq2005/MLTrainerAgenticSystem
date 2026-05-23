@@ -126,6 +126,13 @@ class IntentParserAgent(BaseAgent):
             "Return ONLY the JSON."
         )
 
+        # 5. Retry feedback — only present on attempt 2+
+        feedback = self._get_retry_feedback(context)
+        if feedback:
+            parts.append(
+                f"\nPREVIOUS ATTEMPT FAILED — correct this before responding:\n{feedback}"
+            )
+
         return "\n".join(parts)
 
     # -----------------------------------------------------------------------

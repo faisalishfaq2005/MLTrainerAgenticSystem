@@ -11,7 +11,7 @@ Run:
 """
 
 import json
-from agents.b import IntakeManagerAgent
+from agents.intake_manager_agent import IntakeManagerAgent
 from agents.intent_parser_agent import IntentParserAgent
 from orchestrator.job_context import JobContext
 

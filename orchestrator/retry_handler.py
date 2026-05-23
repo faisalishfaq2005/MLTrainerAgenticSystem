@@ -205,14 +205,12 @@ class RetryHandler:
     @staticmethod
     def _inject_feedback(context, stage: str, error_msg: str) -> None:
         """
-        Attach the previous attempt's error to the context so the agent
-        can see it in the next attempt and self-correct.
+        Write the previous attempt's error into context.last_error_feedback.
 
-        Each agent checks context.last_error_feedback at the start of
-        _execute() and incorporates it into the LLM prompt if set.
-        (Agents that don't support feedback simply ignore this field.)
+        Agents read this via BaseAgent._get_retry_feedback() or
+        BaseAgent._apply_retry_feedback_to_messages() and include the error
+        in their next LLM call so the model can self-correct.
+        Agents that don't declare inject_error_feedback=True never see this.
         """
-        if not hasattr(context, "last_error_feedback"):
-            context.last_error_feedback = {}
         context.last_error_feedback[stage] = error_msg
-        logger.debug(f"[{stage}] Injected error feedback for next attempt")
+        logger.debug("[%s] Retry feedback stored for next attempt.", stage)

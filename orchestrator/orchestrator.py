@@ -3,38 +3,32 @@ orchestrator.py
 ---------------
 The public API for running the ML training pipeline.
 
-This is the single entry point that the API layer (api/main.py),
-the UI (ui/app.py), and tests use. Nothing outside the orchestrator/
-folder should import from graph.py, retry_handler.py, etc. directly.
+No external graph library. The pipeline is a simple ordered loop:
+  1. Run the interactive intake conversation until the agent says "ready".
+  2. Run intent_parser to convert raw_prompt → parsed_intent JSON.
+  3. Determine the stage list from execution_plan.get_stages_for_task().
+  4. Run each stage in order via RetryHandler (per-stage retry config).
+  5. Checkpoint JobContext to SQLite after every completed stage.
+
+Resume works because each completed stage is recorded in
+context.stage_results — on resume the loop just skips those stages.
 
 USAGE:
-
     from orchestrator.orchestrator import Orchestrator
 
-    # 1. Create the orchestrator (once per process)
-    orc = Orchestrator()
+    orc = Orchestrator(agents={"intent_parser": IntentParserAgent(router), ...})
 
-    # 2. Create a new job and run the intake conversation
     job_id = orc.new_job()
-
-    # Interactive loop (this is what the API/UI drives):
     print(orc.get_opening_message(job_id))
+
     while True:
-        user_msg = input("User: ")
-        reply = orc.send_intake_message(job_id, user_msg)
+        reply = orc.send_intake_message(job_id, input("You: "))
         print("Agent:", reply["message"])
         if reply["ready"]:
             break
 
-    # 3. Run the pipeline (blocks until complete or failed)
     result = orc.run_pipeline(job_id)
     print(result)
-
-    # 4. Check status of a running job
-    status = orc.get_status(job_id)
-
-    # 5. Resume a crashed job
-    result = orc.resume_job(job_id)
 """
 
 import logging
@@ -42,10 +36,12 @@ import time
 import uuid
 from typing import Optional
 
-from orchestrator.pipeline_state import PipelineState, empty_state, state_to_context
+from orchestrator.job_context import JobContext
+from orchestrator.retry_handler import RetryHandler
+from orchestrator.execution_plan import get_stages_for_task, should_deploy
 from storage.job_store import JobStore
-from orchestrator.graph import build_graph
-from agents.b import IntakeManagerAgent
+from agents.intake_manager_agent import IntakeManagerAgent
+from llm.router import LLMRouter
 
 logger = logging.getLogger(__name__)
 
@@ -55,65 +51,70 @@ class Orchestrator:
     Owns the full lifecycle of every ML training job.
 
     Responsibilities:
-      - Create and track jobs (job_id → state)
-      - Drive the interactive intake phase (run_turn loop)
-      - Hand off to LangGraph once intake is complete
-      - Persist state after every stage
-      - Expose status, logs, and results to the API layer
+      - Create and track jobs (job_id → JobContext in SQLite)
+      - Drive the interactive intake phase (send_intake_message loop)
+      - Run each pipeline stage sequentially with per-stage retries
+      - Checkpoint context to SQLite after every stage
+      - Resume interrupted jobs by skipping already-completed stages
+      - Expose status and results to the API / UI layer
 
     Thread safety:
-      Each job_id has its own LangGraph thread_id, so concurrent jobs
-      are isolated. The SQLite store uses WAL mode for concurrent reads.
+      Each job has its own JobContext object. SQLite uses WAL mode for
+      concurrent reads. Do not share a single JobContext across threads.
     """
 
     def __init__(
         self,
         agents: Optional[dict] = None,
         db_path: str = "workspace/jobs.db",
-        bypass_validation: bool = False,
     ):
         """
         Args:
-            agents:             Dict of stage_name → agent instance.
-                                Pass None to run with placeholder nodes
-                                (useful during development).
-            db_path:            Path to the SQLite database file.
-            bypass_validation:  If True, skip live API validation during
-                                intake (for testing / demo mode).
+            agents:  Dict of stage_name → agent instance. Stages without an
+                     agent are skipped with a warning (useful while building).
+                     {
+                       "intent_parser":  IntentParserAgent(...),
+                       "dataset":        DatasetAgent(...),
+                       "preprocessing":  PreprocessingAgent(...),
+                       "config":         ConfigAgent(...),
+                       "architecture":   ArchitectureAgent(...),
+                       "codegen":        CodegenAgent(...),
+                       "monitor":        MonitorAgent(...),
+                       "deploy":         DeployAgent(...),
+                     }
+            db_path: Path to the SQLite database for job checkpoints.
         """
-        self._agents = agents or {}
-        self._store  = JobStore(db_path=db_path)
-        self._graph  = build_graph(self._agents)
-        self._bypass = bypass_validation
+        self._agents: dict = agents or {}
+        self._store = JobStore(db_path=db_path)
 
-        # In-memory registry: job_id → IntakeManagerAgent
-        # (only exists while intake is in progress)
+        # In-memory: job_id → IntakeManagerAgent.
+        # Only exists while intake is in progress; freed once intake completes.
         self._intake_agents: dict[str, IntakeManagerAgent] = {}
 
-        # LangGraph thread config per job
-        self._thread_configs: dict[str, dict] = {}
-
         logger.info(
-            f"Orchestrator ready | "
-            f"agents={list(self._agents.keys())} | "
-            f"db={db_path}"
+            "Orchestrator ready | agents=%s | db=%s",
+            list(self._agents.keys()),
+            db_path,
         )
 
-    # ── Job lifecycle ─────────────────────────────────────────────────────────
+    # ── Job lifecycle ──────────────────────────────────────────────────────────
 
-    def new_job(self) -> str:
+    def new_job(self, llm_router: Optional[LLMRouter] = None) -> str:
         """
         Create a new job and return its job_id.
-        Initialises the intake agent and persists an empty state.
+
+        Args:
+            llm_router: LLMRouter for the intake agent. Defaults to the
+                        free-fallback router (Groq → Ollama) when None.
         """
         job_id = f"job_{uuid.uuid4().hex[:8]}"
-        state  = empty_state(job_id)
+        context = JobContext(job_id=job_id)
 
-        self._intake_agents[job_id]  = IntakeManagerAgent(bypass_validation=self._bypass)
-        self._thread_configs[job_id] = {"configurable": {"thread_id": job_id}}
+        router = llm_router or LLMRouter.from_collected_info({}, max_tokens=800)
+        self._intake_agents[job_id] = IntakeManagerAgent(llm_router=router)
 
-        self._store.save(state, status="running")
-        logger.info(f"New job created: {job_id}")
+        self._store.save(context, status="running")
+        logger.info("New job created: %s", job_id)
         return job_id
 
     def get_opening_message(self, job_id: str) -> str:
@@ -123,216 +124,250 @@ class Orchestrator:
             raise ValueError(f"No intake agent for job {job_id!r}. Call new_job() first.")
         return agent.get_opening_message()
 
-    # ── Interactive intake ────────────────────────────────────────────────────
+    # ── Interactive intake ─────────────────────────────────────────────────────
 
     def send_intake_message(self, job_id: str, user_message: str) -> dict:
         """
-        Send one user message to the intake agent and get a reply.
+        Forward one user message to the intake agent and return its reply.
 
         Returns:
-            {
-              "message": str,    the agent's reply
-              "ready":   bool,   True = intake complete, call run_pipeline()
-              "stage":   str,    current intake stage label
-            }
+            {"message": str, "ready": bool}
 
-        When ready=True, the collected_info has been written into the
-        persisted state and run_pipeline() can be called.
+        When ready=True, call run_pipeline(job_id) to start training.
         """
         agent = self._intake_agents.get(job_id)
         if agent is None:
             raise ValueError(f"No intake agent for job {job_id!r}.")
 
-        result = agent.run_turn(user_message)
+        result = agent.converse(user_message)
 
         if result["ready"]:
-            # Finalise: write raw_prompt, conversation_history, collected_info
-            # into a fresh JobContext, then persist in the store
-            state = self._store.load(job_id) or empty_state(job_id)
-            context = state_to_context(state)
-            agent.finalise(context)
-
-            # Write context fields back into state and persist
-            from orchestrator.pipeline_state import context_to_state_patch
-            patch = context_to_state_patch(context)
-            for k, v in patch.items():
-                state[k] = v  # type: ignore[literal-required]
-
-            self._store.save(state, status="running")
-            logger.info(f"[{job_id}] Intake complete — ready for pipeline.")
+            context = self._store.load(job_id) or JobContext(job_id=job_id)
+            agent.finalize(context)
+            self._store.save(context, status="running")
+            del self._intake_agents[job_id]   # free memory
+            logger.info("[%s] Intake complete — ready for pipeline.", job_id)
 
         return result
 
-    # ── Pipeline execution ────────────────────────────────────────────────────
+    # ── Pipeline execution ─────────────────────────────────────────────────────
 
     def run_pipeline(self, job_id: str) -> dict:
         """
-        Run the full LangGraph pipeline for a job that has completed intake.
+        Run the full pipeline for a job that has completed intake.
+        Blocks until the pipeline finishes (success or failure).
 
-        This method blocks until the pipeline finishes (success or failure).
-        For non-blocking execution, run it in a background thread or async task.
+        Stage order:
+          1. intent_parser  — always first; determines task_type
+          2. task-specific  — from execution_plan.get_stages_for_task(task_type)
+
+        Already-completed stages (in context.stage_results) are skipped,
+        so calling run_pipeline on an interrupted job resumes correctly.
 
         Returns:
             {
-              "job_id":        str,
-              "status":        "completed" | "failed",
-              "hf_model_url":  str | None,
-              "hf_space_url":  str | None,
+              "job_id":         str,
+              "status":         "completed" | "failed",
+              "hf_model_url":   str | None,
+              "hf_space_url":   str | None,
               "failure_reason": str | None,
-              "duration_s":    float,
+              "current_stage":  str | None,
+              "duration_s":     float,
+              "errors":         list,
             }
         """
-        state = self._store.load(job_id)
-        if state is None:
-            raise ValueError(f"Job {job_id!r} not found in store.")
-        if state.get("collected_info") is None:
+        context = self._store.load(job_id)
+        if context is None:
+            raise ValueError(f"Job {job_id!r} not found.")
+        if context.collected_info is None:
             raise RuntimeError(
                 f"Job {job_id!r} has not completed intake. "
                 "Call send_intake_message() until ready=True first."
             )
 
-        thread_config = self._thread_configs.get(
-            job_id, {"configurable": {"thread_id": job_id}}
-        )
-
-        logger.info(f"[{job_id}] Starting pipeline...")
+        logger.info("[%s] Starting pipeline.", job_id)
         t0 = time.monotonic()
 
         try:
-            final_state: PipelineState = self._graph.invoke(
-                state,
-                config=thread_config,
-            )
-        except Exception as e:
-            logger.error(f"[{job_id}] Graph raised unhandled exception: {e}", exc_info=True)
-            state["pipeline_failed"]  = True
-            state["failure_reason"]   = f"Unhandled graph error: {e}"
-            state["current_stage"]    = "failed"
-            state["training_status"]  = "failed"
-            self._store.save(state, status="failed")
-            return self._build_result(state, time.monotonic() - t0)
+            # ── Phase 1: intent_parser ─────────────────────────────────────────
+            if "intent_parser" not in context.stage_results:
+                if self._run_stage(job_id, "intent_parser", context):
+                    return self._build_result(context, time.monotonic() - t0)
 
-        duration = time.monotonic() - t0
-        succeeded = not final_state.get("pipeline_failed", False)
-        db_status = "completed" if succeeded else "failed"
+            # ── Phase 2: task-specific stages ──────────────────────────────────
+            task_type = (context.parsed_intent or {}).get("task_type", "")
+            if not task_type:
+                context.pipeline_failed = True
+                context.failure_reason = "intent_parser returned no task_type."
+                context.training_status = "failed"
+                self._store.save(context, status="failed")
+                return self._build_result(context, time.monotonic() - t0)
 
-        self._store.save(final_state, status=db_status)
-        logger.info(
-            f"[{job_id}] Pipeline {db_status} in {duration:.1f}s"
-        )
+            task_stages = get_stages_for_task(task_type)
 
-        return self._build_result(final_state, duration)
+            # Drop deploy if credentials or task type don't warrant it
+            if "deploy" in task_stages and not should_deploy(task_type, context.parsed_intent):
+                task_stages = [s for s in task_stages if s != "deploy"]
 
-    # ── Job status & info ─────────────────────────────────────────────────────
+            for stage_name in task_stages:
+                if stage_name in context.stage_results:
+                    logger.info("[%s] Skipping completed stage: %s", job_id, stage_name)
+                    continue
+                if self._run_stage(job_id, stage_name, context):
+                    return self._build_result(context, time.monotonic() - t0)
 
-    def get_status(self, job_id: str) -> dict:
+        except Exception as exc:
+            logger.error("[%s] Unhandled exception in pipeline: %s", job_id, exc, exc_info=True)
+            context.pipeline_failed = True
+            context.failure_reason = f"Unhandled error: {type(exc).__name__}: {exc}"
+            context.training_status = "failed"
+            self._store.save(context, status="failed")
+            return self._build_result(context, time.monotonic() - t0)
+
+        context.training_status = "completed"
+        context.current_stage = "completed"
+        self._store.save(context, status="completed")
+        logger.info("[%s] Pipeline completed in %.1fs.", job_id, time.monotonic() - t0)
+        return self._build_result(context, time.monotonic() - t0)
+
+    def _run_stage(self, job_id: str, stage_name: str, context: JobContext) -> bool:
         """
-        Return a lightweight status dict for a job.
-        Safe to call while the job is running.
+        Run one pipeline stage with retries.
+
+        Mutates context in place (merges agent output, updates retry_counts,
+        records the stage in stage_results) and checkpoints to SQLite.
 
         Returns:
-            {
-              "job_id":        str,
-              "status":        "running" | "completed" | "failed",
-              "current_stage": str | None,
-              "task_type":     str | None,
-              "errors":        list,
-            }
+            True  — stage failed after all retries; pipeline should stop.
+            False — stage succeeded or was skipped; continue to next stage.
         """
-        state = self._store.load(job_id)
-        if state is None:
+        agent = self._agents.get(stage_name)
+
+        if agent is None:
+            logger.warning(
+                "[%s] Stage '%s' has no agent yet — skipping (placeholder).",
+                job_id, stage_name,
+            )
+            context.stage_results[stage_name] = {"status": "skipped"}
+            context.current_stage = stage_name
+            self._store.save(context, status="running")
+            return False
+
+        logger.info("[%s] ▶ Stage: %s", job_id, stage_name)
+        context.current_stage = stage_name
+
+        result, error = RetryHandler.run(
+            agent=agent,
+            context=context,
+            stage=stage_name,
+            retry_counts=context.retry_counts,  # mutated in-place by RetryHandler
+        )
+
+        if error:
+            logger.error("[%s] ✗ Stage '%s' failed: %s", job_id, stage_name, error["reason"])
+            context.pipeline_failed = True
+            context.failure_reason = error["reason"]
+            context.training_status = "failed"
+            self._store.save(context, status="failed")
+            return True
+
+        # Merge agent output fields back into context
+        for key, val in result.items():
+            if key not in ("status", "agent") and hasattr(context, key):
+                setattr(context, key, val)
+
+        context.stage_results[stage_name] = result
+        # Clear feedback for this stage — it succeeded, stale error no longer relevant
+        context.last_error_feedback.pop(stage_name, None)
+        logger.info("[%s] ✓ Stage: %s", job_id, stage_name)
+        self._store.save(context, status="running")
+        return False
+
+    # ── Job status & info ──────────────────────────────────────────────────────
+
+    def get_status(self, job_id: str) -> dict:
+        """Return a lightweight status dict. Safe to call while the job runs."""
+        context = self._store.load(job_id)
+        if context is None:
             return {"job_id": job_id, "status": "not_found"}
 
-        parsed = state.get("parsed_intent") or {}
         db_status = self._store.get_status(job_id) or "unknown"
+        parsed = context.parsed_intent or {}
 
         return {
-            "job_id":        job_id,
-            "status":        db_status,
-            "current_stage": state.get("current_stage"),
-            "task_type":     parsed.get("task_type"),
-            "errors":        state.get("errors", []),
-            "hf_model_url":  state.get("hf_model_url"),
-            "failure_reason": state.get("failure_reason"),
+            "job_id":         job_id,
+            "status":         db_status,
+            "current_stage":  context.current_stage,
+            "task_type":      parsed.get("task_type"),
+            "errors":         context.errors,
+            "hf_model_url":   context.hf_model_url,
+            "failure_reason": context.failure_reason,
         }
 
     def get_logs(self, job_id: str) -> list[str]:
         """Return the training log lines collected so far."""
-        state = self._store.load(job_id)
-        if state is None:
-            return []
-        return list(state.get("training_logs", []))
+        context = self._store.load(job_id)
+        return list(context.training_logs) if context else []
 
     def list_jobs(self, limit: int = 50) -> list[dict]:
         """Return summary rows for recent jobs."""
         return self._store.list_jobs(limit=limit)
 
-    # ── Resume ────────────────────────────────────────────────────────────────
+    # ── Resume / cancel ────────────────────────────────────────────────────────
 
     def resume_job(self, job_id: str) -> dict:
         """
         Resume a job that was interrupted (process crash, timeout, etc.).
 
-        LangGraph's MemorySaver checkpointer is in-process only, so after
-        a restart we reload the last persisted state from SQLite and re-invoke
-        the graph. LangGraph will start from the last completed node because
-        the thread_id still has its checkpoint in the graph's memory
-        (within the same process) — or it will restart from the beginning
-        of the graph if the process was restarted.
-
-        For true cross-process resume, swap MemorySaver for a persistent
-        checkpointer (e.g. langgraph-checkpoint-sqlite or -postgres).
+        Loads the last SQLite checkpoint, resets failure flags and retry
+        counts, then calls run_pipeline. Completed stages are skipped
+        automatically because they are already in context.stage_results.
         """
-        state = self._store.load(job_id)
-        if state is None:
+        context = self._store.load(job_id)
+        if context is None:
             raise ValueError(f"Job {job_id!r} not found.")
 
         db_status = self._store.get_status(job_id)
         if db_status == "completed":
-            logger.info(f"[{job_id}] Already completed — nothing to resume.")
-            return self._build_result(state, 0.0)
+            logger.info("[%s] Already completed — nothing to resume.", job_id)
+            return self._build_result(context, 0.0)
 
-        logger.info(f"[{job_id}] Resuming from stage: {state.get('current_stage')}")
+        logger.info("[%s] Resuming from stage: %s", job_id, context.current_stage)
 
-        # Reset the failure flag so the graph doesn't immediately exit
-        state["pipeline_failed"] = False
-        state["failure_reason"]  = None
-
-        # Register the thread config if missing (new process)
-        if job_id not in self._thread_configs:
-            self._thread_configs[job_id] = {"configurable": {"thread_id": job_id}}
+        # Reset failure state and give each incomplete stage a fresh retry budget
+        context.pipeline_failed = False
+        context.failure_reason = None
+        context.retry_counts = {}
+        self._store.save(context, status="running")
 
         return self.run_pipeline(job_id)
 
     def cancel_job(self, job_id: str) -> bool:
         """
-        Mark a job as cancelled.
-        Does not interrupt a currently-running graph invocation
-        (use a threading.Event or asyncio.Event for that).
-        Returns True if the job existed and was updated.
+        Mark a job as cancelled. Returns True if the job existed.
+        Does not interrupt a currently-running pipeline invocation —
+        use a threading.Event for cooperative cancellation if needed.
         """
-        state = self._store.load(job_id)
-        if state is None:
+        context = self._store.load(job_id)
+        if context is None:
             return False
-        state["training_status"] = "cancelled"
-        state["current_stage"]   = "cancelled"
-        self._store.save(state, status="cancelled")
-        logger.info(f"[{job_id}] Cancelled.")
+        context.training_status = "cancelled"
+        context.current_stage = "cancelled"
+        self._store.save(context, status="cancelled")
+        logger.info("[%s] Cancelled.", job_id)
         return True
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
+    # ── Internal helpers ───────────────────────────────────────────────────────
 
     @staticmethod
-    def _build_result(state: PipelineState, duration_s: float) -> dict:
-        """Build the return dict from run_pipeline()."""
-        succeeded = not state.get("pipeline_failed", False)
+    def _build_result(context: JobContext, duration_s: float) -> dict:
         return {
-            "job_id":         state["job_id"],
-            "status":         "completed" if succeeded else "failed",
-            "hf_model_url":   state.get("hf_model_url"),
-            "hf_space_url":   state.get("hf_space_url"),
-            "failure_reason": state.get("failure_reason"),
-            "current_stage":  state.get("current_stage"),
+            "job_id":         context.job_id,
+            "status":         "completed" if not context.pipeline_failed else "failed",
+            "hf_model_url":   context.hf_model_url,
+            "hf_space_url":   context.hf_space_url,
+            "failure_reason": context.failure_reason,
+            "current_stage":  context.current_stage,
             "duration_s":     round(duration_s, 2),
-            "errors":         state.get("errors", []),
+            "errors":         context.errors,
         }
