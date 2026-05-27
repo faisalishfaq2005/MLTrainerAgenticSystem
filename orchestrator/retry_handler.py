@@ -18,9 +18,12 @@ on final failure.
 import time
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from agents.base_agent import AgentError
+
+if TYPE_CHECKING:
+    from orchestrator.queue_classes import Event_Queue
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +121,7 @@ class RetryHandler:
         context,
         stage: str,
         retry_counts: dict,
+        event_queue: Optional["Event_Queue"] = None,
     ) -> tuple[Optional[dict], Optional[dict]]:
         """
         Run agent with retries. Returns (result, None) on success or
@@ -178,6 +182,18 @@ class RetryHandler:
                         cfg.base_delay * (cfg.backoff ** (attempts_so_far - 1)),
                         cfg.max_delay,
                     )
+                    if event_queue is not None:
+                        from orchestrator.queue_classes import Event, EventType
+                        event_queue.put(Event(
+                            event_type=EventType.STAGE_RETRY,
+                            data={
+                                "stage":        stage,
+                                "attempt":      attempts_so_far + 1,
+                                "max_attempts": cfg.max_attempts,
+                                "delay":        delay,
+                                "error":        last_error_msg or "",
+                            },
+                        ))
                     if delay > 0:
                         logger.info(f"[{stage}] Waiting {delay:.1f}s before retry...")
                         time.sleep(delay)

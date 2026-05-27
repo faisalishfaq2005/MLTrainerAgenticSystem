@@ -42,6 +42,7 @@ from orchestrator.execution_plan import get_stages_for_task, should_deploy
 from storage.job_store import JobStore
 from agents.intake_manager_agent import IntakeManagerAgent
 from llm.router import LLMRouter
+from orchestrator.queue_classes import Event, EventType, Event_Queue, Submission_Queue
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,8 @@ class Orchestrator:
         self,
         agents: Optional[dict] = None,
         db_path: str = "workspace/jobs.db",
+        event_queue: Optional[Event_Queue] = None,
+        submission_queue: Optional[Submission_Queue] = None,
     ):
         """
         Args:
@@ -90,6 +93,8 @@ class Orchestrator:
         # In-memory: job_id → IntakeManagerAgent.
         # Only exists while intake is in progress; freed once intake completes.
         self._intake_agents: dict[str, IntakeManagerAgent] = {}
+        self.event_queue = event_queue or Event_Queue()
+        self.submission_queue = submission_queue or Submission_Queue()
 
         logger.info(
             "Orchestrator ready | agents=%s | db=%s",
@@ -111,7 +116,7 @@ class Orchestrator:
         context = JobContext(job_id=job_id)
 
         router = llm_router or LLMRouter.from_collected_info({}, max_tokens=800)
-        self._intake_agents[job_id] = IntakeManagerAgent(llm_router=router)
+        self._intake_agents[job_id] = IntakeManagerAgent(llm_router=router, event_queue=self.event_queue)
 
         self._store.save(context, status="running")
         logger.info("New job created: %s", job_id)
@@ -187,11 +192,15 @@ class Orchestrator:
 
         logger.info("[%s] Starting pipeline.", job_id)
         t0 = time.monotonic()
+        self._emit(EventType.PIPELINE_START, job_id=job_id)
 
         try:
             # ── Phase 1: intent_parser ─────────────────────────────────────────
             if "intent_parser" not in context.stage_results:
                 if self._run_stage(job_id, "intent_parser", context):
+                    self._emit(EventType.PIPELINE_END, job_id=job_id, status="failed",
+                               duration_s=round(time.monotonic() - t0, 2),
+                               reason=context.failure_reason)
                     return self._build_result(context, time.monotonic() - t0)
 
             # ── Phase 2: task-specific stages ──────────────────────────────────
@@ -201,6 +210,9 @@ class Orchestrator:
                 context.failure_reason = "intent_parser returned no task_type."
                 context.training_status = "failed"
                 self._store.save(context, status="failed")
+                self._emit(EventType.PIPELINE_END, job_id=job_id, status="failed",
+                           duration_s=round(time.monotonic() - t0, 2),
+                           reason=context.failure_reason)
                 return self._build_result(context, time.monotonic() - t0)
 
             task_stages = get_stages_for_task(task_type)
@@ -214,6 +226,9 @@ class Orchestrator:
                     logger.info("[%s] Skipping completed stage: %s", job_id, stage_name)
                     continue
                 if self._run_stage(job_id, stage_name, context):
+                    self._emit(EventType.PIPELINE_END, job_id=job_id, status="failed",
+                               duration_s=round(time.monotonic() - t0, 2),
+                               reason=context.failure_reason)
                     return self._build_result(context, time.monotonic() - t0)
 
         except Exception as exc:
@@ -222,13 +237,19 @@ class Orchestrator:
             context.failure_reason = f"Unhandled error: {type(exc).__name__}: {exc}"
             context.training_status = "failed"
             self._store.save(context, status="failed")
+            self._emit(EventType.PIPELINE_END, job_id=job_id, status="failed",
+                       duration_s=round(time.monotonic() - t0, 2),
+                       reason=context.failure_reason)
             return self._build_result(context, time.monotonic() - t0)
 
+        duration = time.monotonic() - t0
         context.training_status = "completed"
         context.current_stage = "completed"
         self._store.save(context, status="completed")
-        logger.info("[%s] Pipeline completed in %.1fs.", job_id, time.monotonic() - t0)
-        return self._build_result(context, time.monotonic() - t0)
+        logger.info("[%s] Pipeline completed in %.1fs.", job_id, duration)
+        self._emit(EventType.PIPELINE_END, job_id=job_id, status="completed",
+                   duration_s=round(duration, 2))
+        return self._build_result(context, duration)
 
     def _run_stage(self, job_id: str, stage_name: str, context: JobContext) -> bool:
         """
@@ -250,17 +271,21 @@ class Orchestrator:
             )
             context.stage_results[stage_name] = {"status": "skipped"}
             context.current_stage = stage_name
+            self._emit(EventType.STAGE_SKIPPED, stage=stage_name, job_id=job_id)
             self._store.save(context, status="running")
             return False
 
         logger.info("[%s] ▶ Stage: %s", job_id, stage_name)
         context.current_stage = stage_name
+        self._emit(EventType.STAGE_START, stage=stage_name, job_id=job_id)
+        t_stage = time.monotonic()
 
         result, error = RetryHandler.run(
             agent=agent,
             context=context,
             stage=stage_name,
             retry_counts=context.retry_counts,  # mutated in-place by RetryHandler
+            event_queue=self.event_queue,
         )
 
         if error:
@@ -268,6 +293,8 @@ class Orchestrator:
             context.pipeline_failed = True
             context.failure_reason = error["reason"]
             context.training_status = "failed"
+            self._emit(EventType.STAGE_FAILED, stage=stage_name, job_id=job_id,
+                       reason=error["reason"])
             self._store.save(context, status="failed")
             return True
 
@@ -279,7 +306,9 @@ class Orchestrator:
         context.stage_results[stage_name] = result
         # Clear feedback for this stage — it succeeded, stale error no longer relevant
         context.last_error_feedback.pop(stage_name, None)
+        duration = round(time.monotonic() - t_stage, 2)
         logger.info("[%s] ✓ Stage: %s", job_id, stage_name)
+        self._emit(EventType.STAGE_END, stage=stage_name, job_id=job_id, duration_s=duration)
         self._store.save(context, status="running")
         return False
 
@@ -358,6 +387,9 @@ class Orchestrator:
         return True
 
     # ── Internal helpers ───────────────────────────────────────────────────────
+
+    def _emit(self, event_type: EventType, **data) -> None:
+        self.event_queue.put(Event(event_type=event_type, data=data))
 
     @staticmethod
     def _build_result(context: JobContext, duration_s: float) -> dict:

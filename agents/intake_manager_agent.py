@@ -12,6 +12,7 @@ from tool.credential_validator_tool import CredentialValidatorTools
 from llm.prompts.intake_manager_agent_prompt import INTAKE_MANAGER_AGENT_SYSTEM_PROMPT
 from tool.tool_executer import ToolExecuter
 from agents.agent_names import Agents
+from orchestrator.queue_classes import EventType
 logger = logging.getLogger(__name__)
 
 
@@ -69,10 +70,10 @@ class _IntakeState:
 
 class IntakeManagerAgent(BaseAgent):
 
-    def __init__(self,llm_router):
-        super().__init__(name=Agents.INTAKE_MANAGER_AGENT, llm_router=llm_router)
-        self._state=_IntakeState()
-        self._validator_tools=ToolExecuter(Agents.INTAKE_MANAGER_AGENT)
+    def __init__(self, llm_router, event_queue=None):
+        super().__init__(name=Agents.INTAKE_MANAGER_AGENT, llm_router=llm_router, event_queue=event_queue)
+        self._state = _IntakeState()
+        self._validator_tools = ToolExecuter(Agents.INTAKE_MANAGER_AGENT)
         
         
 
@@ -170,10 +171,17 @@ class IntakeManagerAgent(BaseAgent):
                     tool_name = tool.get("name", "")
                     tool_args = tool.get("arguments", {})
                     logger.info("TOOL_EXECUTE name=%s args=%s", tool_name, self._safe_json(tool_args))
+                    self._emit(EventType.TOOL_CALL, agent=self.name,
+                               tool_name=tool_name,
+                               args=self._sanitize_for_log(tool_args))
                     tool_result = self._validator_tools.execute_tool(tool_name=tool_name, tool_args=tool_args)
                     logger.info("TOOL_RESULT name=%s payload=%s", tool_name, self._safe_json(tool_result))
                     self._apply_tool_result(tool_name=tool_name, tool_args=tool_args, tool_result=tool_result)
                     tool_locked_fields.update(self._locked_fields_for_tool(tool_name))
+                    self._emit(EventType.TOOL_RESULT, agent=self.name,
+                               tool_name=tool_name,
+                               is_valid=tool_result.get("is_valid"),
+                               summary=self._tool_result_summary(tool_name, tool_result))
 
                     self._state.messages.append(
                         {
@@ -264,7 +272,10 @@ class IntakeManagerAgent(BaseAgent):
         for attempt in range(len(delays_seconds) + 1):
             try:
                 logger.info("LLM_CALL attempt=%s/%s", attempt + 1, len(delays_seconds) + 1)
-                return self.llm_router.complete(**complete_kwargs)
+                self._emit(EventType.LLM_CALL, agent=self.name)
+                result = self.llm_router.complete(**complete_kwargs)
+                self._emit(EventType.LLM_RESPONSE, agent=self.name)
+                return result
             except LLMRouterError as e:
                 error_text = str(e).lower()
                 is_rate_limit = "rate limit" in error_text
@@ -277,6 +288,14 @@ class IntakeManagerAgent(BaseAgent):
                     delay,
                     attempt + 2,
                     len(delays_seconds) + 1,
+                )
+                self._emit(
+                    EventType.STAGE_RETRY,
+                    stage=self.name,
+                    attempt=attempt + 2,
+                    max_attempts=len(delays_seconds) + 1,
+                    delay=delay,
+                    error="Rate limit hit",
                 )
                 time.sleep(delay)
 
@@ -446,7 +465,16 @@ class IntakeManagerAgent(BaseAgent):
         # llm_provider / llm_model / llm_api_key are optional by design
         return True
 
-    def finalize(self,context)-> None:
+    @staticmethod
+    def _tool_result_summary(tool_name: str, result: dict) -> str:
+        parts = []
+        if result.get("username"):
+            parts.append(f"username={result['username']}")
+        if result.get("error"):
+            parts.append(f"error={result['error']}")
+        return "  ".join(parts)
+
+    def finalize(self, context) -> None:
         """
         Write the three intake outputs into JobContext.
         Call this once run_turn() returns ready=True.

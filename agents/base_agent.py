@@ -1,8 +1,11 @@
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Optional, TYPE_CHECKING
 import logging
 import time
- 
+
+if TYPE_CHECKING:
+    from orchestrator.queue_classes import Event_Queue, EventType
+
 logger = logging.getLogger(__name__)
 from orchestrator.job_context import JobContext
 
@@ -28,11 +31,11 @@ class BaseAgent(ABC):
         3. result dict is returned to orchestrator
         4. orchestrator merges result into context and passes to next agent
     """
-    def __init__(self, name:str, llm_router=None):
-        self.name=name
-        self.llm_router=llm_router
+    def __init__(self, name: str, llm_router=None, event_queue: Optional["Event_Queue"] = None):
+        self.name = name
+        self.llm_router = llm_router
+        self.event_queue = event_queue
         self.logger = logging.getLogger(f"agent.{name}")
-
         super().__init__()
 
     def run(self, context:JobContext) -> dict:
@@ -64,6 +67,13 @@ class BaseAgent(ABC):
             codegen_agent  → {"train_script": "...", "requirements": "..."}
         """
     
+    def _emit(self, event_type: "EventType", **data) -> None:
+        """Put an event into the event queue if one is wired up."""
+        if self.event_queue is None:
+            return
+        from orchestrator.queue_classes import Event
+        self.event_queue.put(Event(event_type=event_type, data=data))
+
     def _require_context_keys(self, context: JobContext, *keys: str):  # noqa: F821
         """Helper — raise clearly if a required context field is missing."""
         for key in keys:

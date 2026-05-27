@@ -29,6 +29,7 @@ from agents.base_agent import BaseAgent, AgentError
 from agent_schemas.intent_parser_schema import INTENT_JSON_TEMPLATE
 from llm.prompts.intent_parser_agent_prompt import INTENT_PARSER_AGENT_SYSTEM_PROMPT
 from agents.agent_names import Agents
+from orchestrator.queue_classes import EventType
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +42,8 @@ class IntentParserAgent(BaseAgent):
     Writes: context.parsed_intent
     """
 
-    def __init__(self, llm_router):
-        super().__init__(name=Agents.INTENT_PARSER_AGENT, llm_router=llm_router)
+    def __init__(self, llm_router, event_queue=None):
+        super().__init__(name=Agents.INTENT_PARSER_AGENT, llm_router=llm_router, event_queue=event_queue)
 
     def _execute(self, context) -> dict:
         self._require_context_keys(context, "raw_prompt", "collected_info")
@@ -50,6 +51,7 @@ class IntentParserAgent(BaseAgent):
         user_message = self._build_llm_input(context)
 
         self.logger.info("Calling LLM to parse intent...")
+        self._emit(EventType.LLM_CALL, agent=self.name)
         raw_response = self.llm_router.complete(
             system_prompt=INTENT_PARSER_AGENT_SYSTEM_PROMPT,
             user_message=user_message,
@@ -60,9 +62,12 @@ class IntentParserAgent(BaseAgent):
         self._ensure_structure(parsed)
         self._validate(parsed)
 
+        task = parsed.get("task_type")
+        expertise = parsed.get("user_expertise_level")
+        self._emit(EventType.LLM_RESPONSE, agent=self.name,
+                   summary=f"task={task}  expertise={expertise}")
         self.logger.info(
-            f"parsed_intent ready: task={parsed.get('task_type')}, "
-            f"expertise={parsed.get('user_expertise_level')}"
+            f"parsed_intent ready: task={task}, expertise={expertise}"
         )
 
         # Orchestrator merges this return dict into context:

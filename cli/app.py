@@ -18,6 +18,7 @@ checks the database, and offers the user two choices:
 """
 
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -29,8 +30,10 @@ from rich.text import Text
 from logging_config import setup_logging
 from llm.router import LLMRouter
 from agents.intent_parser_agent import IntentParserAgent
+from agents.base_agent import AgentError
 from orchestrator.orchestrator import Orchestrator
 from orchestrator.job_context import JobContext
+from cli.event_listener import EventListener
 
 console = Console()
 VERSION = "0.1.0"
@@ -85,21 +88,106 @@ def _divider() -> None:
 
 
 def _result_row(label: str, value) -> None:
-    console.print(f"  [green]✓[/green]  [bold]{label:<14}[/bold] {value}")
+    console.print(f"  [green]OK[/green]  [bold]{label:<14}[/bold] {value}")
+
+
+import re as _re
+
+
+# Each row: (type-name substrings, label, hint).
+# Matched against type(e).__name__.lower() for every exception in the chain,
+# innermost first.  "connection" catches Connection*, APIConnection*, etc.
+_EXC_TYPE_MAP: list[tuple[tuple[str, ...], str, str]] = [
+    (("auth", "authentication"),          # AuthError, AuthenticationError, OAuthError…
+     "Authentication error", "Check your API key or token."),
+    (("ratelimit", "rate_limit", "toomanyrequests"),
+     "Rate limit", "Wait a moment, then try again."),
+    (("timeout", "timedout"),
+     "Timeout", "The request timed out. Try again."),
+    (("connection", "networkerror"),      # ConnectionError, ConnectionRefusedError,
+     "Network error",                      # APIConnectionError, ConnectionResetError…
+     "Check your internet connection and try again."),
+    (("gaierror", "herror", "oserror"),   # socket.gaierror / low-level OS errors
+     "Network error", "Check your internet connection and try again."),
+    (("badrequest", "bad_request", "invalidrequest"),
+     "Bad request", "Check your model name and request settings."),
+    (("internalservererror", "serviceunavailable", "overloaded"),
+     "Provider error", "The LLM provider is having issues. Try again."),
+    (("jsondecodeerror", "invaliddecoding"),
+     "LLM format error", "The model returned an unexpected format. Try again."),
+]
+
+
+def _exc_chain(exc: BaseException) -> list[BaseException]:
+    """Return [outermost, …, innermost] without cycles."""
+    chain: list[BaseException] = []
+    node: BaseException | None = exc
+    while node is not None and node not in chain:
+        chain.append(node)
+        node = node.__cause__ or node.__context__
+    return chain
+
+
+def _classify_exception(exc: BaseException) -> tuple[str, str]:
+    """
+    Classify an exception by type — not by string-matching its message.
+    Walks the full __cause__/__context__ chain, checking the innermost
+    (most specific) exception first.  Always returns a (label, hint) pair;
+    the final fallback handles every exception not covered by _EXC_TYPE_MAP.
+    """
+    for e in reversed(_exc_chain(exc)):
+        t = type(e).__name__.lower()
+
+        for keywords, label, hint in _EXC_TYPE_MAP:
+            if any(k in t for k in keywords):
+                return label, hint
+
+        # stdlib network base-classes whose names may not contain "connection"
+        # (e.g. TimeoutError, BrokenPipeError, plain ConnectionError)
+        if isinstance(e, (ConnectionError, TimeoutError)):
+            return "Network error", "Check your internet connection and try again."
+
+    return "Error", "See the log file for full details."
+
+
+def _clean_message(exc: BaseException) -> str:
+    """
+    Return a readable one-line summary by taking the innermost exception's
+    message and stripping repetitive 'Module.ClassName: ' / 'XException - '
+    wrappers that providers stack when re-raising.
+    No fixed list of class names — the regex handles any provider.
+    """
+    # Use innermost exception — it has the cleanest, most specific message
+    innermost = _exc_chain(exc)[-1]
+    msg = str(innermost)
+
+    # Strip patterns like "litellm.SomeError: ", "openai.APIError: ", "GroqException - "
+    msg = _re.sub(r'(\w+\.)*\w+(Error|Exception|Warning|Fault)(?::\s*|\s+-\s*)', '', msg)
+    msg = msg.strip()
+    return (msg[:200] + "...") if len(msg) > 200 else msg or repr(innermost)
+
+
+def _show_error(exc: BaseException) -> None:
+    """Display a clean two-line error. Never shows a raw traceback."""
+    label, hint = _classify_exception(exc)
+    short = _clean_message(exc)
+    console.print(f"\n  [bold red]{label}[/bold red]  [dim]{short}[/dim]")
+    console.print(f"  [dim]{hint}[/dim]\n")
 
 
 # ── Agent registration ─────────────────────────────────────────────────────────
 
 def _register_pipeline_agents(orc: Orchestrator, collected_info: dict) -> None:
     """
-    Build the pipeline LLM router from the user's collected credentials and
-    register all available pipeline agents.  Add new agents here as they are
-    implemented.
+    Build the pipeline LLM router and register all available pipeline agents.
+    All agents receive the shared event_queue so they can stream events to the UI.
+    Add new agents here as they are implemented.
     """
     pipeline_router = LLMRouter.from_collected_info(collected_info)
-    orc._agents["intent_parser"] = IntentParserAgent(llm_router=pipeline_router)
-    # orc._agents["dataset"]       = DatasetAgent(llm_router=pipeline_router)
-    # orc._agents["config"]        = ConfigAgent(llm_router=pipeline_router)
+    eq = orc.event_queue
+    orc._agents["intent_parser"] = IntentParserAgent(llm_router=pipeline_router, event_queue=eq)
+    # orc._agents["dataset"]       = DatasetAgent(llm_router=pipeline_router, event_queue=eq)
+    # orc._agents["config"]        = ConfigAgent(llm_router=pipeline_router, event_queue=eq)
     # ... add agents as they are built
 
 
@@ -258,6 +346,9 @@ def main() -> None:
     intake_router = LLMRouter.from_collected_info({}, max_tokens=800)
     orc = Orchestrator(agents={}, db_path="workspace/jobs.db")
 
+    listener = EventListener(orc.event_queue, console)
+    listener.start()
+
     # ── Resume check ───────────────────────────────────────────────────────────
     resume = _check_resume(orc)
 
@@ -265,6 +356,7 @@ def main() -> None:
         job_id, kind = resume
         if kind == "pipeline":
             if _handle_pipeline_resume(orc, job_id):
+                listener.stop()
                 return   # done — pipeline resumed and finished
             # user chose "new session", fall through
         else:
@@ -283,6 +375,7 @@ def main() -> None:
         try:
             user_input = console.input("  [bold blue]You »[/bold blue]  ").strip()
         except (EOFError, KeyboardInterrupt):
+            listener.stop()
             console.print("\n  [dim]Goodbye. Run [bold]mltrainer[/bold] again to resume.[/dim]\n")
             sys.exit(0)
 
@@ -290,12 +383,17 @@ def main() -> None:
             continue
 
         console.print()
+        # Plain indicator so event output can stream through
+        console.print("  [dim]thinking...[/dim]")
 
-        with console.status("  [dim]Thinking…[/dim]", spinner="dots"):
+        try:
             resp = orc.send_intake_message(job_id, user_input)
-
-        _agent(resp["message"])
-        ready = resp["ready"]
+            time.sleep(0.15)   # let listener flush buffered events
+            _agent(resp["message"])
+            ready = resp["ready"]
+        except (AgentError, Exception) as exc:
+            time.sleep(0.15)
+            _show_error(exc)
 
     # ── Pipeline ───────────────────────────────────────────────────────────────
     _divider()
@@ -303,8 +401,10 @@ def main() -> None:
     collected_info = orc._store.load(job_id).collected_info
     _register_pipeline_agents(orc, collected_info)
 
-    with console.status("  [bold]Analysing your request…[/bold]", spinner="dots"):
-        result = orc.run_pipeline(job_id)
+    result = orc.run_pipeline(job_id)
+
+    # Let the listener drain any final events before showing the summary panel
+    listener.stop()
 
     _show_pipeline_result(orc, job_id, result)
     _clear_session()
